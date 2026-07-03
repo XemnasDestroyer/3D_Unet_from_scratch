@@ -1,301 +1,305 @@
-# Interactúa con el sistema operativo. Se usara principialmente para
-# verificar si los archivos .nii existen antes de intentar abrirlos.
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-# Para pasar argumentos desde la terminal (-help, train, predict).
-import argparse 
-
-# Torchsummary es una herramienta para mostrar un resumen de la arquitectura 
-#   del modelo, incluyendo el número de parámetros y la forma de las salidas 
-#   de cada capa.    
-from torchsummary import summary
-# CrossEntropyLoss nos permitirá cambiar el peso de cada clase para
-#   manejar el desbalance de clases (muchos más píxeles de fondo 
-#   que de tumor).
-#from torch.nn import CrossEntropyLoss
-
-# Biblioteca estándar para abrir, leer y escribir archivos de 
-# imágenes médicas en formato NIfTI (.nii o .nii.gz)
-import nibabel as nib
-
-# - El Dataset organiza los diccioarios en imágenes
-# - El DataLoader se encarga de crear los batches, mezclar los datos y 
-#       cargarlos en GPU eficientemente
-from monai.data import Dataset, DataLoader
-
-# Para realizar la inferencia por ventanas deslizantes, que es una técnica
-#   que permite segmentar imágenes grandes dividiéndolas en partes más pequeñas.
-#   Luego se encarga de ensamblar las predicciones de cada parte para obtener
-#   la segmentación completa.
-from monai.inferers import sliding_window_inference
-
-# Librería para visualizar los resultados en tiempo real durante 
-#   el entrenamiento.
-import matplotlib.pyplot as plt
-
-# Configuración específica de la red neuronal
-from config import (NUM_EPOCHS,
-                    device, model, optimizer, criterion,
-                    train_transforms, val_transforms)
-
+import csv
+import random
 from time import time
 
+import torch
 from tqdm import tqdm
 
-import torch
+from monai.inferers import sliding_window_inference
+from monai.apps import DecathlonDataset
+from monai.data import (
+    Dataset,
+    DataLoader,
+    CacheDataset,
+    load_decathlon_datalist,
+    decollate_batch,
+)
+
+from torch.cuda.amp import autocast, GradScaler
+
+from config import (
+    NUM_EPOCHS,
+    VAL_INTERVAL,
+    BATCH_SIZE,
+    ROI_SIZE,
+    device,
+    model,
+    optimizer,
+    scheduler,
+    loss_function,
+    dice_metric,
+    post_pred,
+    post_label,
+    train_transforms,
+    val_transforms
+)
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
 def load_medical_volume():
     """
-    Descarga el dataset BrainTS si no lo encuentra en el disco.
-
-    Parameters
-    ----------
-
-    Returns
-    -------
-    dict
-        A dictionary containing the paths to the image and label files.
-    """  
-    from monai.apps import DecathlonDataset
-
+    Descarga y carga el dataset Task01_BrainTumour del Medical Segmentation Decathlon.
+    Divide los sujetos etiquetados en entrenamiento y validación siguiendo una proporción 80/20.
+    """
 
     root_dir = "./dataset_brats"
     os.makedirs(root_dir, exist_ok=True)
-    ds = DecathlonDataset(
+
+    # Descarga del dataset si no está disponible
+    DecathlonDataset(
         root_dir=root_dir,
         task="Task01_BrainTumour",
         section="training",
         download=True,
-        cache_num=5,     # Solo mantiene 5 imágenes en memoria RAM
+        cache_num=5,
     )
 
-    # 1. Definimos las rutas de BraTS
-    list_dir = "./dataset_brats/Task01_BrainTumour" # Donde está el dataset.json
+    list_dir = "./dataset_brats/Task01_BrainTumour"
     jsonlist = os.path.join(list_dir, "dataset.json")
-    datadir = list_dir # Directorio base para las rutas del JSON
-    
-    num_workers = 0
+    datadir = list_dir
 
-    # 2. Cargamos las listas de archivos de BraTS
-    # is_segmentation=True es clave para que cargue la ruta de la etiqueta
-
-    from monai.data import load_decathlon_datalist
-    train_files = load_decathlon_datalist(jsonlist, True, "training", base_dir=datadir)
-    val_files = load_decathlon_datalist(jsonlist, True, "test", base_dir=datadir)
-    
-    print(f"BraTS Training: {len(train_files)} sujetos")
-    print(f"BraTS Validation: {len(val_files)} sujetos") 
-    
-    train_ds = Dataset(data=train_files, transform=train_transforms)
-    train_loader = DataLoader(
-        train_ds, 
-        batch_size=1, 
-        num_workers=num_workers, 
-        shuffle=True, 
-        drop_last=True
+    # Cargamos todos los sujetos etiquetados de training
+    all_labeled_files = load_decathlon_datalist(
+        jsonlist,
+        is_segmentation=True,
+        data_list_key="training",
+        base_dir=datadir,
     )
 
-    val_ds = Dataset(data=val_files, transform=val_transforms)
+    # División reproducible 80/20
+    random.seed(42)
+    random.shuffle(all_labeled_files)
+
+    split_index = int(len(all_labeled_files) * 0.8)
+
+    train_files = all_labeled_files[:split_index]
+    val_files = all_labeled_files[split_index:]
+
+    print("\n" + "=" * 50)
+    print(f"[INFO] Total de sujetos etiquetados: {len(all_labeled_files)}")
+    print(f"[INFO] Sujetos de entrenamiento: {len(train_files)}")
+    print(f"[INFO] Sujetos de validación: {len(val_files)}")
+    print("=" * 50 + "\n")
+
+    # Puedes cambiar CacheDataset por Dataset si te da problemas de RAM.
+    train_ds = CacheDataset(
+        data=train_files,
+        transform=train_transforms,
+        cache_rate=0.2,
+        num_workers=0,
+    )
+
+    val_ds = CacheDataset(
+        data=val_files,
+        transform=val_transforms,
+        cache_rate=0.2,
+        num_workers=0,
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=True,
+    )
+
     val_loader = DataLoader(
-        val_ds, 
-        batch_size=1, # En validación solemos usar 1 para evaluar el volumen completo
-        num_workers=num_workers, 
-        shuffle=False
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
     )
 
     return train_loader, val_loader
 
-def load_checkpoint(model, optimizer, scheduler, filename):
+
+def check_batch_shapes(train_loader):
     """
-    Carga un checkpoint guardado previamente para continuar el entrenamiento desde donde se dejó.
-    Si no hay un checkpoint, devuelve 0 para empezar desde la época 1.
-
-    Parameters
-    ----------
-    model : torch.nn.Module
-        The model to load the checkpoint into.
-    optimizer : torch.optim.Optimizer
-        The optimizer to load the checkpoint into.
-    scheduler : torch.optim.lr_scheduler._LRScheduler
-        The scheduler to load the checkpoint into.
-    filename : str
-        The path to the checkpoint file.
-
-    Returns
-    -------
-    int
-        The epoch from which to continue training.
+    Comprueba formas de imagen y etiqueta antes de entrenar.
+    Es importante para verificar canales, clases y formato de las máscaras.
     """
 
-    if os.path.exists(filename):
-        print(f"--> Cargando Checkpoint desde {filename}...")
-        checkpoint = config.torch.load(filename)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        if optimizer is not None: 
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if scheduler is not None: 
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        return checkpoint['epoch']
-    
-    print(f"--> No se encontró el checkpoint en {filename}. Empezando desde cero.")
-    return 0
+    batch = next(iter(train_loader))
 
-def save_checkpoint(model, optimizer, scheduler, epoch, filename):
+    print("\n" + "=" * 50)
+    print("[CHECK] Forma de image:", batch["image"].shape)
+    print("[CHECK] Forma de label:", batch["label"].shape)
+    print("[CHECK] Valores únicos de label:", torch.unique(batch["label"]))
+    print("=" * 50 + "\n")
+
+
+def save_checkpoint(epoch, metric, filename="best_swinunetr_model.pth"):
     """
-    Guarda el estado actual del modelo, optimizador y scheduler en un checkpoint para poder continuar el entrenamiento más tarde.
-
-    Parameters
-    ----------
-    model : torch.nn.Module
-        The model to save.
-    optimizer : torch.optim.Optimizer
-        The optimizer to save.
-    scheduler : torch.optim.lr_scheduler._LRScheduler
-        The scheduler to save.
-    epoch : int
-        The current epoch number to save in the checkpoint.
-    filename : str
-        The path to the checkpoint file.
+    Guarda el mejor modelo según Dice medio de validación.
     """
 
     checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
+        "epoch": epoch,
+        "best_metric": metric,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
     }
-    config.torch.save(checkpoint, filename)
-    print(f"--> Checkpoint guardado en época {epoch}")
 
-def train(train_loader):
-    print("\nIniciando entrenamiento...")
-    historial_errores = []
+    torch.save(checkpoint, filename)
+    print(f"[INFO] Mejor modelo guardado en época {epoch} con Dice {metric:.4f}")
 
-    MAX_STEPS_PER_EPOCH = 50
+
+def validate(val_loader):
+    """
+    Evalúa el modelo sobre el conjunto de validación.
+    Calcula Dice medio y Dice por clase.
+    """
+
+    model.eval()
+
+    with torch.no_grad():
+        for val_data in tqdm(val_loader, desc="Validación"):
+            val_inputs = val_data["image"].to(device)
+            val_labels = val_data["label"].to(device)
+
+            with autocast(enabled=torch.cuda.is_available()):
+                val_outputs = sliding_window_inference(
+                    inputs=val_inputs,
+                    roi_size=ROI_SIZE,
+                    sw_batch_size=1,
+                    predictor=model,
+                    overlap=0.5
+                )
+
+            val_outputs = [post_pred(i) for i in decollate_batch(val_outputs)]
+            val_labels = [post_label(i) for i in decollate_batch(val_labels)]
+
+            dice_metric(y_pred=val_outputs, y=val_labels)
+
+        dice_result, not_nans = dice_metric.aggregate()
+        dice_metric.reset()
+
+    # dice_result suele tener un valor por clase si reduction="mean_batch"
+    dice_per_class = dice_result.cpu().numpy()
+
+    # Si include_background=False, estas clases serán las tumorales.
+    mean_dice = dice_per_class.mean()
+
+    return mean_dice, dice_per_class
+
+
+def train(train_loader, val_loader):
+    """
+    Entrenamiento principal del modelo.
+    Guarda loss, Dice medio y Dice por clase en un CSV.
+    """
+
+    print("\nIniciando entrenamiento...\n")
+
+    scaler = GradScaler(enabled=torch.cuda.is_available())
+
+    best_metric = -1.0
+    best_metric_epoch = -1
+
+    log_path = "training_log.csv"
+
+    with open(log_path, mode="w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "epoch",
+            "train_loss",
+            "val_mean_dice",
+            "dice_class_1",
+            "dice_class_2",
+            "dice_class_3",
+            "epoch_time_seconds",
+        ])
+
+    total_start = time()
 
     for epoch in range(NUM_EPOCHS):
+        epoch_start = time()
+
+        print("-" * 50)
+        print(f"Época {epoch + 1}/{NUM_EPOCHS}")
+
         model.train()
-        error_epoca = 0.0
-        pasos_reales = 0
-        
-        # tqdm ahora itera directamente sobre tu DataLoader
-        loop_batches = tqdm(train_loader, desc=f"Época [{epoch+1}/{NUM_EPOCHS}]")
-        
-        for step, batch in enumerate(loop_batches):
-            # Limitamos el número de pasos de entrenamiento para que no tarde 2 horas
-            if step >= MAX_STEPS_PER_EPOCH:
-                break
-            # Extraemos las imágenes y las etiquetas de tu batch.
-            # Ajusta las claves ('image', 'label') según cómo hayas definido tu DataLoader
-            inputs = batch["image"].to(device)
-            targets = batch["label"].to(device) 
-            
-            # Forward pass
+        epoch_loss = 0.0
+        step_count = 0
+
+        loop_batches = tqdm(train_loader, desc=f"Entrenamiento {epoch + 1}/{NUM_EPOCHS}")
+
+        for batch_data in loop_batches:
+            inputs = batch_data["image"].to(device)
+            labels = batch_data["label"].to(device)
+
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            
-            # Backward pass y optimización
-            loss.backward()
-            optimizer.step()
-            
-            # Acumular el error
-            error_epoca += loss.item()
-            pasos_reales += 1
-            
-            # Actualizamos la barra de progreso
-            loop_batches.set_postfix(error=f"{loss.item():.4f}")
-            
-        # Calcular el error medio de la época
-        # len(train_loader) nos da el número total de batches
-        error_medio = error_epoca / pasos_reales if pasos_reales > 0 else 0
-        historial_errores.append(error_medio)
-        
-        print(f"Error medio de la Época {epoch+1}: {error_medio:.4f}\n")
 
-    print("¡Entrenamiento finalizado!")
+            with autocast(enabled=torch.cuda.is_available()):
+                outputs = model(inputs)
+                loss = loss_function(outputs, labels)
 
-    # ==========================================
-    # 4. Visualización con Matplotlib
-    # ==========================================
-    if historial_errores:
-        plt.figure(figsize=(8, 5))
-        plt.plot(range(1, NUM_EPOCHS + 1), historial_errores, marker='o', linestyle='-', color='b', label='Error de Entrenamiento')
-        plt.title('Curva de Aprendizaje - Swin UNETR (BraTS)')
-        plt.xlabel('Época')
-        plt.ylabel('Pérdida')
-        plt.xticks(range(1, NUM_EPOCHS + 1))
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-def predict(model_path, image_path, mask_path):
-    model = config.model
+            epoch_loss += loss.item()
+            step_count += 1
 
-    # Cargar los pesos y poner en modo evaluación
-    load_checkpoint(model, None, None, model_path)
-    model.eval() 
+            loop_batches.set_postfix(loss=f"{loss.item():.4f}")
 
-    # Preparar los datos
-    data = predict_transform({"image": image_path, "label": mask_path})
-    
-    # Preparamos el tensor para la red (añadimos dimensión de batch)
-    input_tensor = data["image"].unsqueeze(0).to(config.device) # [1, 1, D, H, W]
-    
-    with config.torch.no_grad():
-        prediction = sliding_window_inference(
-            inputs=input_tensor, 
-            roi_size=(64, 64, 64), 
-            sw_batch_size=4, 
-            predictor=model,
-            overlap=0.5
-        )
+        train_loss = epoch_loss / step_count if step_count > 0 else 0.0
+        epoch_time = time() - epoch_start
 
-    # Sigmoid + Umbral de 0.5 para binarizar
-    prediction_binaria = (config.torch.sigmoid(prediction) > 0.5).float()
+        print(f"[TRAIN] Loss media: {train_loss:.4f}")
+        print(f"[TIME] Tiempo época: {epoch_time / 60:.2f} minutos")
 
-    # Convertir el tensor de predicción a un array de numpy
-    # Quitamos las dimensiones extras de Batch y Canal para dejarlo en [D, H, W]
-    pred_mask = prediction_binaria[0, 0].cpu().numpy() # [D, H, W]
+        # Validación cada VAL_INTERVAL épocas
+        if (epoch + 1) % VAL_INTERVAL == 0:
+            val_mean_dice, dice_per_class = validate(val_loader)
 
-    # Cargar la imagen original para copiar sus "metadatos"
-    # Esto es vital para que 3D Slicer sepa dónde colocar la máscara
-    original_nifti = nib.load(image_path)
-    header = original_nifti.header
-    affine = original_nifti.affine
+            print(f"[VAL] Dice medio: {val_mean_dice:.4f}")
+            print(f"[VAL] Dice por clase: {dice_per_class}")
 
-    # Crear el nuevo objeto NIfTI
-    # Nos aseguramos de que el tipo de dato sea compatible (int16 o uint8 suele bastar)
-    pred_nifti = nib.Nifti1Image(pred_mask.astype("uint8"), affine, header)
+            # Scheduler sobre Dice de validación
+            scheduler.step(val_mean_dice)
 
-    # Guardar en el disco
-    output_path = "./assets/data/3d/brain/prediccion_3d_final.nii"
-    nib.save(pred_nifti, output_path)
+            # Guardar logs
+            dice_values = list(dice_per_class)
 
-    print(f"¡Segmentación guardada con éxito en: {output_path}!")
+            # Aseguramos 3 clases tumorales aunque haya menos por algún motivo
+            while len(dice_values) < 3:
+                dice_values.append(float("nan"))
 
-def visualize_progress(lista_loss, lista_dice):
-    # Crear una figura con dos columnas
-    plt.figure(figsize=(14, 5))
+            with open(log_path, mode="a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    epoch + 1,
+                    train_loss,
+                    val_mean_dice,
+                    dice_values[0],
+                    dice_values[1],
+                    dice_values[2],
+                    epoch_time,
+                ])
 
-    # Gráfica de la Pérdida (Loss)
-    plt.subplot(1, 2, 1)
-    plt.plot(range(1, len(lista_loss) + 1), lista_loss, label='Pérdida (Tversky)', color='tab:red', linewidth=2)
-    plt.title('Progreso del Error (Loss)')
-    plt.xlabel('Época')
-    plt.ylabel('Valor de Loss')
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.legend()
+            # Guardar mejor modelo
+            if val_mean_dice > best_metric:
+                best_metric = val_mean_dice
+                best_metric_epoch = epoch + 1
+                save_checkpoint(epoch + 1, best_metric)
 
-    # Guardar la imagen en el disco
-    plt.tight_layout()
-    plt.savefig("entrenamiento_stats.png")
-    print("\n[INFO] Gráficas guardadas como 'entrenamiento_stats.png'")
-    plt.show()
+    total_time = time() - total_start
+
+    print("\nEntrenamiento finalizado.")
+    print(f"Mejor Dice medio: {best_metric:.4f} en época {best_metric_epoch}")
+    print(f"Tiempo total: {total_time / 3600:.2f} horas")
+    print(f"Logs guardados en: {log_path}")
+
 
 if __name__ == "__main__":
-    train_loader, test_loader = load_medical_volume()
-    train(train_loader)
+    train_loader, val_loader = load_medical_volume()
+
+    check_batch_shapes(train_loader)
+
+    train(train_loader, val_loader)

@@ -1,120 +1,208 @@
-NUM_EPOCHS = 10
+# =========================
+# CONFIGURACIÓN GENERAL
+# =========================
 
-IN_CHANNELS = 4
-OUT_CHANNELS = 4
-BACKGROUND_AS_CLASS = False
+NUM_EPOCHS = 100  # Para entrenamiento final. Para prueba rápida puedes usar 1 o 2.
+
+IN_CHANNELS = 4          # Modalidades MRI del dataset
+OUT_CHANNELS = 4         # Fondo + 3 clases tumorales
+INCLUDE_BACKGROUND = False
 
 TRAIN_CUDA = True
-# Peso de la clase minoritária/positva (tumor) en la función de pérdida BCE. 
-#   Se puede ajustar según el desequilibrio de clases.
-BCE_WEIGHT = 250
-
 ROI_SIZE = (64, 64, 64)
 
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-5
+BATCH_SIZE = 1
 
-# Transformaciones para CARGAR ambos (imagen y máscara real).
-# - Compose: Permite encadenar varias transformaciones en un solo paso.
-# - LoadImaged: Carga los archivos .nii y los convierte en tensores.
-# - EnsureChannelFirstd: Asegura que los datos tengan la forma [Canal, D, H, W].
-# - ScaleIntensityd: Normaliza la intensidad de las imágenes (no se aplica 
-#       a las máscaras).
-# - RandCropByPosNegLabeld: Recorta aleatoriamente parches de la imagen, 
-#       dando prioridad a las regiones con etiquetas (pos) sobre las 
-#       sin etiquetas (neg).
-# - ToTensord: Convierte los datos a tensores de PyTorch.
-# - Lambdad: Permite aplicar una función personalizada a los datos.
-# - RandRotated, RandFlipd, RandGaussianNoised: Transformaciones de 
-#       aumento de datos (data augmentation) para hacer el modelo más variado.
+# Número de parches extraídos por muestra.
+# Si el entrenamiento va muy lento, prueba con 4 en vez de 8.
+NUM_SAMPLES = 4
+
+VAL_INTERVAL = 1
+
+# =========================
+# IMPORTS
+# =========================
+
+import torch
+import torch.optim as optim
+
 from monai.transforms import (
-    Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityd, 
-    RandCropByPosNegLabeld, ToTensord, Lambdad,
-    Orientationd, NormalizeIntensityd, SpatialPadd,
-    RandRotated, RandFlipd, RandGaussianNoised)
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Orientationd,
+    NormalizeIntensityd,
+    SpatialPadd,
+    RandCropByPosNegLabeld,
+    RandFlipd,
+    RandGaussianNoised,
+    ToTensord,
+)
 
-# ------- Definimos las transformaciones -------
+from monai.losses import DiceCELoss
+from monai.metrics import DiceMetric
+from monai.transforms import AsDiscrete
+
+from SwinUNetR import SwinUNETR
+
+
+# =========================
+# DISPOSITIVO
+# =========================
+
+device = torch.device("cuda" if torch.cuda.is_available() and TRAIN_CUDA else "cpu")
+print(f"Device utilizado: {device}")
+
+if torch.cuda.is_available() and TRAIN_CUDA:
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+
+# =========================
+# TRANSFORMACIONES
+# =========================
+
 train_transforms = Compose([
     LoadImaged(keys=["image", "label"]),
-    # BraTS ya suele venir con canales, si no, usa EnsureChannelFirstd
+
     EnsureChannelFirstd(keys=["image", "label"]),
+
     Orientationd(keys=["image", "label"], axcodes="RAS"),
-    # Normalización específica para MRI (No usar ScaleIntensityRanged de CT)
-    NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-    SpatialPadd(keys=["image", "label"], spatial_size=ROI_SIZE),
-    # Crop que asegure que caiga tumor en los parches
+
+    NormalizeIntensityd(
+        keys="image",
+        nonzero=True,
+        channel_wise=True
+    ),
+
+    SpatialPadd(
+        keys=["image", "label"],
+        spatial_size=ROI_SIZE
+    ),
+
     RandCropByPosNegLabeld(
         keys=["image", "label"],
         label_key="label",
         spatial_size=ROI_SIZE,
-        pos=1, neg=1,
-        num_samples=8,
+        pos=1,
+        neg=1,
+        num_samples=NUM_SAMPLES,
     ),
+
+    # Aumentos de datos sencillos. Puedes quitarlos si quieres una prueba rápida.
+    RandFlipd(
+        keys=["image", "label"],
+        spatial_axis=0,
+        prob=0.5
+    ),
+
+    RandFlipd(
+        keys=["image", "label"],
+        spatial_axis=1,
+        prob=0.5
+    ),
+
+    RandFlipd(
+        keys=["image", "label"],
+        spatial_axis=2,
+        prob=0.5
+    ),
+
+    RandGaussianNoised(
+        keys="image",
+        prob=0.15,
+        mean=0.0,
+        std=0.01
+    ),
+
     ToTensord(keys=["image", "label"]),
 ])
 
-# Transforms para Validación
+
 val_transforms = Compose([
     LoadImaged(keys=["image", "label"]),
+
     EnsureChannelFirstd(keys=["image", "label"]),
+
     Orientationd(keys=["image", "label"], axcodes="RAS"),
-    NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+
+    NormalizeIntensityd(
+        keys="image",
+        nonzero=True,
+        channel_wise=True
+    ),
+
     ToTensord(keys=["image", "label"]),
 ])
 
-# Usamos las mismas claves para que la máscara real esté alineada con la imagen
-predict_transform = Compose([
-    LoadImaged(keys=["image", "label"]),
-    EnsureChannelFirstd(keys=["image", "label"]),
-    ScaleIntensityd(keys=["image"]),
-    ToTensord(keys=["image", "label"])
-])
-# ------- Fin de las transformaciones -------
 
-# ------- Configuración del dispositivo, modelo, optimizador y función de pérdida -------
-# Importamos el modelo UNet3D que definimos en unet.py. Este modelo es una
-# arquitectura de red neuronal convolucional diseñada 
-# para segmentación de imágenes 3D.
-from SwinUNetR import SwinUNETR
-# La función de pérdida con pesos para manejar el desbalance de clases. Aplica una importancia
-#   distinta a las distintas clases (fondo vs tumor) para que la red no se "olvide" de aprender a segmentar el tumor,
-#   que es la clase minoritaria.# Librería principal de Deep Learning. Proporciona los tensores, 
-# operaciones matemáticas y la funcionalidad de GPU.
-import torch
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(device)
+# Para predicción conviene usar el mismo preprocesamiento que en validación.
+predict_transform = val_transforms
+
+
+# =========================
+# MODELO
+# =========================
+
 model = SwinUNETR(
     img_size=ROI_SIZE,
-    in_channels=IN_CHANNELS,            # 1 porque solo cargamos FLAIR de momento
-    out_channels=OUT_CHANNELS,           # Típico en BraTS (TC, WT, ET)
-    feature_size=48,          # Tamaño base de las características
+    in_channels=IN_CHANNELS,
+    out_channels=OUT_CHANNELS,
+    feature_size=48,
     use_checkpoint=True
 ).to(device)
 
-# Optimizador (ajusta los pesos de la red)
-# Deberia porbar con AdamW, pero Adam es un buen punto de partida
-# Contiene los algoritmos que "aprenden", como Adam. Es el que ajusta los
-# pesos de la red durante el entrenamiento.
-import torch.optim as optim
-optimizer = optim.Adam(model.parameters())
 
-# alpha=0.2 (peso a los falsos negativos)
-# beta=0.8 (peso a los falsos positivos -> ¡Esto es lo que evita que sea vaga!)
-# Para calcular la métrica de TverskyLoss, que es una medida de solapamiento 
-#   entre la máscara real y la predicha. Nos dico qué tan lejos está
-#   nuestra predicción de la realidad.
-from monai.losses import TverskyLoss
-loss_function = TverskyLoss(sigmoid=True, alpha=0.5, beta=0.5)
+# =========================
+# OPTIMIZADOR
+# =========================
 
-# Contiene los bloques de construcción de las redes neuronales (capas, 
-# activaciones, etc.)
-from monai.losses import DiceLoss
-pos_weight = torch.tensor([BCE_WEIGHT], dtype=torch.float32).to(device)
-criterion = DiceLoss(to_onehot_y=4, softmax=True)
+optimizer = optim.AdamW(
+    model.parameters(),
+    lr=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY
+)
 
-# Scheduler: Reduce el LR cuando el loss se estanca
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=30, factor=0.5, verbose=True)    
 
-# Para convertir la salida de la red (que es un valor continuo entre 0 y 1)
-#   en una máscara binaria (0 o 1) usando un umbral (NO LO USO).
-# from monai.transforms import AsDiscrete
-# post_pred = AsDiscrete(threshold=0.5) # Umbral de 0.5 para ser más estrictos
-# ------- Fin de la configuración -------
+# =========================
+# FUNCIÓN DE PÉRDIDA
+# =========================
+
+loss_function = DiceCELoss(
+    to_onehot_y=True,
+    softmax=True,
+    include_background=INCLUDE_BACKGROUND
+)
+
+
+# =========================
+# MÉTRICAS Y POSTPROCESADO
+# =========================
+
+dice_metric = DiceMetric(
+    include_background=INCLUDE_BACKGROUND,
+    reduction="mean_batch",
+    get_not_nans=True
+)
+
+post_pred = AsDiscrete(
+    argmax=True,
+    to_onehot=OUT_CHANNELS
+)
+
+post_label = AsDiscrete(
+    to_onehot=OUT_CHANNELS
+)
+
+
+# =========================
+# SCHEDULER
+# =========================
+
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="max",        # max porque monitorizaremos Dice de validación
+    patience=5,
+    factor=0.5
+)
