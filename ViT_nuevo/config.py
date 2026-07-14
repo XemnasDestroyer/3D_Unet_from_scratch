@@ -25,8 +25,8 @@ VAL_INTERVAL = 5
 #   "swinunetr" -> modelo principal del TFG
 #   "unet3d"    -> baseline 3D U-Net
 
-MODEL_NAME = "swinunetr"
-# MODEL_NAME = "unet3d"
+# MODEL_NAME = "swinunetr"
+MODEL_NAME = "unet3d"
 
 # =========================
 # IMPORTS
@@ -52,7 +52,7 @@ from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
 from monai.transforms import AsDiscrete
 
-from monai.networks import UNet, SwinUNETR
+from monai.networks.nets import UNet, SwinUNETR
 
 
 # =========================
@@ -148,13 +148,12 @@ def create_model(model_name: str):
     if model_name == "swinunetr":
         print("[INFO] Modelo seleccionado: Swin UNETR")
 
-        model = SwinUNETR(
-            img_size=ROI_SIZE,
+        return SwinUNETR(
             in_channels=IN_CHANNELS,
             out_channels=OUT_CHANNELS,
             feature_size=48,
             use_checkpoint=True
-        ).to(device)
+        )
 
     elif model_name == "unet3d":
         print("[INFO] Modelo seleccionado: 3D U-Net baseline")
