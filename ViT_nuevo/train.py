@@ -41,10 +41,13 @@ from config import (
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
-LAST_CHECKPOINT_PATH = "last_checkpoint.pth"
-# BEST_MODEL_PATH = "best_swinunetr_model.pth"
-BEST_MODEL_PATH = "best_3dunet_model.pth"
-LOG_PATH = "training_log.csv"
+LAST_CHECKPOINT_PATH = "last_checkpoint_swinunetr.pth"
+BEST_MODEL_PATH = "best_swinunetr_model.pth"
+LOG_PATH = "training_log_swinunetr.csv"
+
+# LAST_CHECKPOINT_PATH = "last_checkpoint_3dunet.pth"
+# BEST_MODEL_PATH = "best_3dunet_model.pth"
+# LOG_PATH = "training_log_3dunet.csv"
 
 
 def load_medical_volume():
@@ -611,8 +614,8 @@ def train(train_loader, val_loader):
 if __name__ == "__main__":
     train_loader, val_loader = load_medical_volume()
 
-    RUN_TRAINING = False
-    RUN_PREDICTION = True
+    RUN_TRAINING = True
+    RUN_PREDICTION = False
 
     if RUN_TRAINING:
         check_batch_shapes(train_loader)
