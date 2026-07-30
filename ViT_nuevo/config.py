@@ -25,8 +25,8 @@ VAL_INTERVAL = 5
 #   "swinunetr" -> modelo principal del TFG
 #   "unet3d"    -> baseline 3D U-Net
 
-MODEL_NAME = "swinunetr"
-# MODEL_NAME = "unet3d"
+# MODEL_NAME = "swinunetr"
+MODEL_NAME = "unet3d"
 
 # =========================
 # IMPORTS
